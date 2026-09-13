@@ -573,8 +573,80 @@ inline void iqk_transpose_8x8(__m256 * m) {
     }
 }
 
-template <int nr = 8>
-static inline float convert_to_q8_k_r8(int k, float d0, const __m256i * qx, const int16_t * scales, uint32_t * block, int8_t * q8_k) {
+#ifdef HAVE_FANCY_SIMD
+
+static const uint32_t iqk_t16x8_A0[16] = {0, 16, 2, 18, 4, 20, 6, 22, 8, 24, 10, 26, 12, 28, 14, 30};
+static const uint32_t iqk_t16x8_A1[16] = {1, 17, 3, 19, 5, 21, 7, 23, 9, 25, 11, 27, 13, 29, 15, 31};
+static const uint32_t iqk_t16x8_B0[16] = {0, 1, 16, 17, 4, 5, 20, 21, 8, 9, 24, 25, 12, 13, 28, 29};
+static const uint32_t iqk_t16x8_B1[16] = {2, 3, 18, 19, 6, 7, 22, 23, 10, 11, 26, 27, 14, 15, 30, 31};
+static const uint32_t iqk_t16x8_C0[16] = {0, 8, 1, 9, 2, 10, 3, 11, 16, 24, 17, 25, 18, 26, 19, 27};
+static const uint32_t iqk_t16x8_C1[16] = {4, 12, 5, 13, 6, 14, 7, 15, 20, 28, 21, 29, 22, 30, 23, 31};
+
+static inline void iqk_stage_q8_k_r16(uint32_t * stage, int k, int ib32, __m256i i0) {
+    _mm256_storeu_si256((__m256i *)(stage + ib32*128 + k*8), i0);
+}
+
+static inline void iqk_stage_q8_k_r16_packed(uint32_t * stage, int k, int ib32, __m256i i0) {
+    auto i0_l = _mm256_castsi256_si128(i0);
+    auto i0_h = _mm256_extracti128_si256(i0, 1);
+    auto t0 = _mm_unpacklo_epi32(i0_l, i0_h);
+    auto t1 = _mm_unpackhi_epi32(i0_l, i0_h);
+    auto dst = stage + ib32*128 + k*8;
+    _mm_storeu_si128((__m128i *)dst+0, _mm_unpacklo_epi64(t0, t1));
+    _mm_storeu_si128((__m128i *)dst+1, _mm_unpackhi_epi64(t0, t1));
+}
+
+static inline void iqk_transpose_xor_q8_k_r16(const uint32_t * stage, int8_t * q8_k) {
+    const auto ia0 = _mm512_loadu_si512((const __m512i *)iqk_t16x8_A0);
+    const auto ia1 = _mm512_loadu_si512((const __m512i *)iqk_t16x8_A1);
+    const auto ib0 = _mm512_loadu_si512((const __m512i *)iqk_t16x8_B0);
+    const auto ib1 = _mm512_loadu_si512((const __m512i *)iqk_t16x8_B1);
+    const auto ic0 = _mm512_loadu_si512((const __m512i *)iqk_t16x8_C0);
+    const auto ic1 = _mm512_loadu_si512((const __m512i *)iqk_t16x8_C1);
+    const auto flip = _mm512_set1_epi8(-128);
+
+    for (int ib32 = 0; ib32 < 8; ++ib32) {
+        const __m512i * in = (const __m512i *)(stage + ib32*128);
+        __m512i z[8];
+        for (int j = 0; j < 8; ++j) z[j] = _mm512_loadu_si512(in + j);
+
+        __m512i a[8];
+        a[0] = _mm512_permutex2var_epi32(z[0], ia0, z[1]);
+        a[1] = _mm512_permutex2var_epi32(z[0], ia1, z[1]);
+        a[2] = _mm512_permutex2var_epi32(z[2], ia0, z[3]);
+        a[3] = _mm512_permutex2var_epi32(z[2], ia1, z[3]);
+        a[4] = _mm512_permutex2var_epi32(z[4], ia0, z[5]);
+        a[5] = _mm512_permutex2var_epi32(z[4], ia1, z[5]);
+        a[6] = _mm512_permutex2var_epi32(z[6], ia0, z[7]);
+        a[7] = _mm512_permutex2var_epi32(z[6], ia1, z[7]);
+
+        __m512i b[8];
+        b[0] = _mm512_permutex2var_epi32(a[0], ib0, a[2]);
+        b[1] = _mm512_permutex2var_epi32(a[1], ib0, a[3]);
+        b[2] = _mm512_permutex2var_epi32(a[0], ib1, a[2]);
+        b[3] = _mm512_permutex2var_epi32(a[1], ib1, a[3]);
+        b[4] = _mm512_permutex2var_epi32(a[4], ib0, a[6]);
+        b[5] = _mm512_permutex2var_epi32(a[5], ib0, a[7]);
+        b[6] = _mm512_permutex2var_epi32(a[4], ib1, a[6]);
+        b[7] = _mm512_permutex2var_epi32(a[5], ib1, a[7]);
+
+        __m512i * out = (__m512i *)q8_k + 8*ib32;
+        _mm512_storeu_si512(out + 0, _mm512_xor_si512(_mm512_permutex2var_epi32(b[0], ic0, b[4]), flip));
+        _mm512_storeu_si512(out + 1, _mm512_xor_si512(_mm512_permutex2var_epi32(b[0], ic1, b[4]), flip));
+        _mm512_storeu_si512(out + 2, _mm512_xor_si512(_mm512_permutex2var_epi32(b[1], ic0, b[5]), flip));
+        _mm512_storeu_si512(out + 3, _mm512_xor_si512(_mm512_permutex2var_epi32(b[1], ic1, b[5]), flip));
+        _mm512_storeu_si512(out + 4, _mm512_xor_si512(_mm512_permutex2var_epi32(b[2], ic0, b[6]), flip));
+        _mm512_storeu_si512(out + 5, _mm512_xor_si512(_mm512_permutex2var_epi32(b[2], ic1, b[6]), flip));
+        _mm512_storeu_si512(out + 6, _mm512_xor_si512(_mm512_permutex2var_epi32(b[3], ic0, b[7]), flip));
+        _mm512_storeu_si512(out + 7, _mm512_xor_si512(_mm512_permutex2var_epi32(b[3], ic1, b[7]), flip));
+    }
+}
+#endif
+
+template <int nr, bool Staged>
+static inline float convert_to_q8_k_r8_impl(int k, float d0, const __m256i * qx, const int16_t * scales,
+                                            uint32_t * block, int8_t * q8_k,
+                                            [[maybe_unused]] uint32_t * stage) {
     auto max_i16 = _mm256_setzero_si256();
     __m256i qs[16];
     for (int ib32 = 0; ib32 < 8; ++ib32) {
@@ -595,9 +667,22 @@ static inline float convert_to_q8_k_r8(int k, float d0, const __m256i * qx, cons
     if (dnew < 1.f) {
         dnew = 1.f; needs_scaling = false;
     }
-    auto scale = _mm256_set1_ps(std::abs(dnew) > 1e-9f ? 1/dnew : 0.f);
+    const float inv_dnew = std::abs(dnew) > 1e-9f ? 1/dnew : 0.f;
+#ifdef HAVE_FANCY_SIMD
+    auto scale = _mm512_set1_ps(inv_dnew);
+#else
+    auto scale = _mm256_set1_ps(inv_dnew);
+#endif
     for (int ib32 = 0; ib32 < 8; ++ib32) {
         if (needs_scaling) {
+#ifdef HAVE_FANCY_SIMD
+            auto w0 = _mm512_cvt_roundps_epi32(_mm512_mul_ps(scale, _mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(qs[2*ib32+0]))), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+            auto w1 = _mm512_cvt_roundps_epi32(_mm512_mul_ps(scale, _mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(qs[2*ib32+1]))), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+            auto i0 = _mm512_castsi512_si256(w0);
+            auto i1 = _mm512_extracti64x4_epi64(w0, 1);
+            auto i2 = _mm512_castsi512_si256(w1);
+            auto i3 = _mm512_extracti64x4_epi64(w1, 1);
+#else
             auto i0 = _mm256_cvtepi16_epi32(_mm256_castsi256_si128(qs[2*ib32+0]));
             auto i1 = _mm256_cvtepi16_epi32(_mm256_extracti128_si256(qs[2*ib32+0], 1));
             auto i2 = _mm256_cvtepi16_epi32(_mm256_castsi256_si128(qs[2*ib32+1]));
@@ -606,26 +691,83 @@ static inline float convert_to_q8_k_r8(int k, float d0, const __m256i * qx, cons
             i1 = _mm256_cvtps_epi32(_mm256_round_ps(_mm256_mul_ps(scale, _mm256_cvtepi32_ps(i1)), _MM_ROUND_NEAREST));
             i2 = _mm256_cvtps_epi32(_mm256_round_ps(_mm256_mul_ps(scale, _mm256_cvtepi32_ps(i2)), _MM_ROUND_NEAREST));
             i3 = _mm256_cvtps_epi32(_mm256_round_ps(_mm256_mul_ps(scale, _mm256_cvtepi32_ps(i3)), _MM_ROUND_NEAREST));
+#endif
             i0 = _mm256_packs_epi32(i0, i1);
             i2 = _mm256_packs_epi32(i2, i3);
             i0 = _mm256_packs_epi16(i0, i2);
-            i0 = _mm256_permutevar8x32_epi32(i0, _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7));
-            _mm256_storeu_si256((__m256i *)block, i0);
+            if constexpr (Staged) {
+#ifdef HAVE_FANCY_SIMD
+                iqk_stage_q8_k_r16(stage, k, ib32, i0);
+#endif
+            } else {
+                i0 = _mm256_permutevar8x32_epi32(i0, _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7));
+                _mm256_storeu_si256((__m256i *)block, i0);
+            }
         } else {
-            // 0, 1, 2, 3, 4, 5, 6, 7, 8, 16, 17, 18, 19, 20, 21, 22, 23, 9, 10, 11, 12, 13, 14, 15, 24, 25, 26, 27, 28, 29, 30, 31
             auto i0 = _mm256_packs_epi16(qs[2*ib32+0], qs[2*ib32+1]);
-            auto i0_l = _mm256_castsi256_si128(i0);
-            auto i0_h = _mm256_extracti128_si256(i0, 1);
-            _mm_storeu_si128((__m128i *)block+0, _mm_unpacklo_epi64(i0_l, i0_h));
-            _mm_storeu_si128((__m128i *)block+1, _mm_unpackhi_epi64(i0_l, i0_h));
+            if constexpr (Staged) {
+#ifdef HAVE_FANCY_SIMD
+                iqk_stage_q8_k_r16_packed(stage, k, ib32, i0);
+#endif
+            } else {
+                auto i0_l = _mm256_castsi256_si128(i0);
+                auto i0_h = _mm256_extracti128_si256(i0, 1);
+                _mm_storeu_si128((__m128i *)block+0, _mm_unpacklo_epi64(i0_l, i0_h));
+                _mm_storeu_si128((__m128i *)block+1, _mm_unpackhi_epi64(i0_l, i0_h));
+            }
         }
-        auto qs = (uint32_t *)q8_k + 8*nr*ib32;
-        for (int l = 0; l < 8; ++l) {
-            qs[nr*l + k] = block[l];
+        if constexpr (!Staged) {
+            auto qsd = (uint32_t *)q8_k + 8*nr*ib32;
+            for (int l = 0; l < 8; ++l) {
+                qsd[nr*l + k] = block[l];
+            }
         }
     }
     return dnew;
 }
+
+template <int nr = 8>
+static inline float convert_to_q8_k_r8(int k, float d0, const __m256i * qx, const int16_t * scales, uint32_t * block, int8_t * q8_k) {
+    return convert_to_q8_k_r8_impl<nr, false>(k, d0, qx, scales, block, q8_k, nullptr);
+}
+
+template <int nr>
+struct Q8KRepack {
+#ifdef HAVE_FANCY_SIMD
+    static_assert(nr == 16, "the staged transpose is built for block_q8_k_r16 (nr = 16)");
+    alignas(64) uint32_t stage[8*nr*8];
+    inline float convert(int k, float d0, const __m256i * qx, const int16_t * scales, uint32_t *, int8_t *) {
+        return convert_to_q8_k_r8_impl<nr, true>(k, d0, qx, scales, nullptr, nullptr, stage);
+    }
+    inline void stage_block(int k, int ib32, __m256i i0, uint32_t *, int8_t *) {
+        iqk_stage_q8_k_r16(stage, k, ib32, i0);
+    }
+    inline void stage_block_packed(int k, int ib32, __m256i i0, uint32_t *, int8_t *) {
+        iqk_stage_q8_k_r16_packed(stage, k, ib32, i0);
+    }
+    inline void flush(int8_t * q8_k) { iqk_transpose_xor_q8_k_r16(stage, q8_k); }
+#else
+    inline float convert(int k, float d0, const __m256i * qx, const int16_t * scales, uint32_t * block, int8_t * q8_k) {
+        return convert_to_q8_k_r8_impl<nr, false>(k, d0, qx, scales, block, q8_k, nullptr);
+    }
+    inline void stage_block(int k, int ib32, __m256i i0, uint32_t * block, int8_t * q8_k) {
+        i0 = _mm256_permutevar8x32_epi32(i0, _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7));
+        _mm256_storeu_si256((__m256i *)block, i0);
+        auto q8 = (uint32_t *)q8_k + 8*nr*ib32;
+        for (int l = 0; l < 8; ++l) q8[nr*l + k] = block[l];
+    }
+    inline void stage_block_packed(int k, int ib32, __m256i i0, uint32_t * block, int8_t * q8_k) {
+        auto i0_l = _mm256_castsi256_si128(i0);
+        auto i0_h = _mm256_extracti128_si256(i0, 1);
+        _mm_storeu_si128((__m128i *)block+0, _mm_unpacklo_epi64(i0_l, i0_h));
+        _mm_storeu_si128((__m128i *)block+1, _mm_unpackhi_epi64(i0_l, i0_h));
+        auto q8 = (uint32_t *)q8_k + 8*nr*ib32;
+        for (int l = 0; l < 8; ++l) q8[nr*l + k] = block[l];
+    }
+    inline void flush(int8_t *) {}
+#endif
+};
+
 
 #else
 // ------------------------------------ __aarch64__ --------------------------------------------------
